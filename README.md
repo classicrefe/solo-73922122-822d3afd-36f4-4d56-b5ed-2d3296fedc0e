@@ -41,6 +41,63 @@
 服务端在返回前会用**不依赖求解器的独立复核器**（纯 Python 重算全部约束）校验每套见证名单，
 结果写在 `verification` / `verification_errors` 字段。
 
+## 记分流水对账（`POST /api/v1/roster/reconcile`）
+
+技术台的记分流水需要先归到换人片段，`team_net_points` 才能用于阵容净胜分分析。
+对账接口接收**未填 `team_net_points`** 的 `/roster/check` 请求，外加：
+
+| 字段 | 含义 |
+| --- | --- |
+| `scoring_entries` | 最多 120 笔有序记分；每笔给 `team_points` / `opponent_points`（各自增加的整数分）与 `candidate_segments`（候选片段号，可跳号、可多个） |
+| `score_checkpoints` | 可选的片段末比分：`segment_number` 与该片段结束时双方本节累计得分 |
+
+归属规则：
+
+- **整笔只能归入一个候选片段**；已知同段的得分可以合记一笔，也可以拆成多笔；
+- **片段号沿流水不得倒退**（因此同一片段的流水笔在流水中连续）；
+- 每个核对点要求「截至该片段的双方累计」同时吻合；
+- 片段净分 = 该段本队增分 − 该段对方增分。
+
+判定结果：
+
+| 状态 | 含义 | 返回 |
+| --- | --- | --- |
+| `resolved` | 每个片段净分在**所有合规归属下都相同** | 逐段 `resolved_team_net_points`、可直接提交 `/roster/check` 的 `request_body`、1 套见证归属 |
+| `ambiguous` | 至少一个片段净分可能变化 | **全部**受影响片段 `affected_segments`；两套完整归属，使 `witness_segment` 的净分不同（供回看录像） |
+| `score_conflict` | 记录无法同时成立 | 精确定位的 `conflicts`（如 `CHECKPOINT_NOT_ATTAINABLE`、`ENTRY_SEGMENT_ORDER_INFEASIBLE`） |
+
+实现要点：`片段数 × 流水笔数` 的网格 DP 做前向 / 后向可达性，逐段枚举合法连续块。
+主流程与 `app/verifier.py` 中**另一套独立实现**互相复核，
+`verification_errors` 非空即代表两者不一致。
+
+对账示例（`/docs` 中 `resolved_demo` / `ambiguous_demo` / `conflict_demo` 均可直接调用）：
+
+```json
+{
+  "players": [1, 2, 3, 4, 5, 6, 7],
+  "target_lineup": [2, 3, 5, 6, 7],
+  "minimum_seconds": 100,
+  "official_seconds": {"1": 300, "2": 600, "3": 600, "4": 300, "5": 300, "6": 300, "7": 600},
+  "segments": [
+    {"duration_seconds": 300, "confirmed_players": [2, 7], "players_substituted": 0},
+    {"duration_seconds": 300, "confirmed_players": [3, 5, 7], "players_substituted": 2}
+  ],
+  "scoring_entries": [
+    {"team_points": 4, "opponent_points": 0, "candidate_segments": [1]},
+    {"team_points": 2, "opponent_points": 0, "candidate_segments": [1, 2]},
+    {"team_points": 0, "opponent_points": 3, "candidate_segments": [2]}
+  ],
+  "score_checkpoints": [
+    {"segment_number": 1, "team_cumulative_points": 4, "opponent_cumulative_points": 0}
+  ]
+}
+```
+
+返回 `resolved`，`resolved_team_net_points = [4, -1]`，`request_body` 即回填了
+`team_net_points` 的 `/roster/check` 请求。三个示例预期结果：
+`resolved_demo → resolved`、`ambiguous_demo → ambiguous`（受影响片段 `[1, 2]`）、
+`conflict_demo → score_conflict`。
+
 ## 快速开始（Docker Compose）
 
 ```bash
@@ -48,8 +105,11 @@ docker compose up --build
 ```
 
 - 交互式文档（含可直接调用的请求示例）：<http://localhost:8000/docs>
+- 终场记分对账说明页：<http://localhost:8000/docs/reconcile>（随 /docs 一起可用）
 - 健康检查：<http://localhost:8000/health>
-- 接口：`POST /api/v1/roster/check`
+- 接口：
+  - `POST /api/v1/roster/check`：阵容达标核对；
+  - `POST /api/v1/roster/reconcile`：记分流水对账（见下节）。
 
 ## 本地开发（无 Docker 时）
 
@@ -87,6 +147,15 @@ python3 -m venv --without-pip .venv
 - `JOINT_SECONDS_INFEASIBLE`：单人秒数都可达，但联合换人结构使它们无法同时满足；
 - `STRUCTURAL_INFEASIBLE`：忽略秒数后五人 / 确认 / 换人结构本身就不成立。
 
+对账接口（`/api/v1/roster/reconcile`）的冲突错误码：
+
+- `ENTRY_HAS_NO_CANDIDATE_SEGMENT`：某笔记分的候选片段为空；
+- `ENTRY_SEGMENT_ORDER_INFEASIBLE`：候选片段无法满足片段号沿流水不倒退；
+- `CHECKPOINT_CUMULATIVE_DECREASE`：后一个核对点的累计小于前一个；
+- `CHECKPOINT_NOT_ATTAINABLE`：核对点累计不等于流水的任何前缀（附最近前缀）；
+- `CHECKPOINT_FINAL_TOTAL_MISMATCH`：最后一段核对点不等于全部记分合计；
+- `CHECKPOINT_UNREACHABLE_AFTER_SEGMENT` / `SCORE_ATTRIBUTION_INFEASIBLE`：结构可达但仍无法同时成立。
+
 ## 测试
 
 ```bash
@@ -100,4 +169,7 @@ python3 -m venv --without-pip .venv
 - 250 个随机实例（含可行 / 扰动冲突变体）逐项对照状态、同场秒数与净胜分边界；
 - 四种判定状态的冻结夹具、阈值边界、422 结构校验；
 - 12 人 × 16 段规模上限的性能与正确性（秒级完成，边界均证明最优）；
-- 独立复核器对各类人为篡改的检出测试。
+- 独立复核器对各类人为篡改的检出测试；
+- 记分对账：3 个 OpenAPI 示例均可调用且状态符合预期、回填请求体可直接提交
+  `/roster/check`、400 个随机实例与「枚举全部归属」的暴力真值逐项对照
+  （状态 / 受影响片段 / 逐段净分 / 两套见证归属），以及 120 笔 × 16 段规模性能。

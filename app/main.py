@@ -1,19 +1,27 @@
 """FastAPI 入口：篮球五人阵容达标核对 API。"""
 from __future__ import annotations
 
+import html
+import json
 import time
 
 from fastapi import Body, FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from .schemas import (
     CheckResponse,
     HealthResponse,
+    ReconcileResponse,
     RosterCheckRequest,
+    RosterReconcileRequest,
+    ScoreAttribution,
+    EntryAssignment,
+    CheckpointResult,
     SegmentAssignment,
     WitnessRoster,
     NetBounds,
 )
+from .attribution import AttributionPlan, ScoreReconciler
 from .solver import RosterCpSolver, SolveOutcome
 from .verifier import (
     actual_substitution_counts,
@@ -29,13 +37,15 @@ app = FastAPI(
         "根据官方逐人在场秒数、换人切分片段与片段确认球员，"
         "用约束规划判定目标五人阵容能否达到最低同场上场时长，"
         "并在达标名单中计算净胜分上下界，每个边界附完整逐段名单供复核。\n\n"
+        "`/api/v1/roster/reconcile`：把技术台的有序记分流水归入换人片段，"
+        "在净分唯一确定时回填 `team_net_points`，否则给出受影响片段与两套完整归属。\n\n"
         "判定状态：\n"
         "- `guaranteed`（必定达标）：所有可行名单的同场秒数都达到阈值；\n"
         "- `possible`（可能达标）：存在达标名单，也存在不达标名单；\n"
         "- `impossible`（无法达标）：记录本身可行，但没有任何名单达标；\n"
         "- `infeasible_record`（原始记录冲突）：约束无法同时成立，只给冲突，不给达标结论。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 STATUS_ZH = {
@@ -333,6 +343,247 @@ def check_roster(
         solver_runs=solver.runs,
         elapsed_ms=(time.perf_counter() - started) * 1000,
     )
+
+
+RECONCILE_EXAMPLES = {
+    "resolved_demo": {
+        "summary": "可对账：逐段净分唯一，返回可直接提交的请求体",
+        "description": (
+            "沿用 roster/check 的可行示例（2 段、7 人），但片段不填 "
+            "team_net_points，改由 3 笔有序记分与 1 个片段末比分核对点约束。"
+            "记分 (4,0) 只能进片段 1，(0,3) 只能进片段 2，"
+            "(2,0) 两段皆可——但核对点 1 要求 4 分，故 (2,0) 必须落在片段 2。"
+            "两段净分分别为 +4 与 -1，在所有合规归属下唯一，因此直接回填。"
+        ),
+        "value": {
+            "players": [1, 2, 3, 4, 5, 6, 7],
+            "target_lineup": [2, 3, 5, 6, 7],
+            "minimum_seconds": 100,
+            "official_seconds": {
+                "1": 300, "2": 600, "3": 600,
+                "4": 300, "5": 300, "6": 300, "7": 600,
+            },
+            "segments": [
+                {
+                    "duration_seconds": 300,
+                    "confirmed_players": [2, 7],
+                    "players_substituted": 0,
+                },
+                {
+                    "duration_seconds": 300,
+                    "confirmed_players": [3, 5, 7],
+                    "players_substituted": 2,
+                },
+            ],
+            "scoring_entries": [
+                {"team_points": 4, "opponent_points": 0, "candidate_segments": [1]},
+                {"team_points": 2, "opponent_points": 0, "candidate_segments": [1, 2]},
+                {"team_points": 0, "opponent_points": 3, "candidate_segments": [2]},
+            ],
+            "score_checkpoints": [
+                {
+                    "segment_number": 1,
+                    "team_cumulative_points": 4,
+                    "opponent_cumulative_points": 0,
+                }
+            ],
+        },
+    },
+    "ambiguous_demo": {
+        "summary": "净分不唯一：列出受影响片段与两套完整归属",
+        "description": (
+            "同样的 2 段、7 人数据；两笔记分 (2,0) 与 (0,1) 的候选片段都是 "
+            "[1,2]，且没有任何核对点，于是「两笔都在片段 1」「两笔都在片段 2」"
+            "「分属两段」都合规：片段 1 与片段 2 的净分都可能变化。"
+            "接口不猜测，返回全部受影响片段，并给出使片段 1 净分不同的两套归属。"
+        ),
+        "value": {
+            "players": [1, 2, 3, 4, 5, 6, 7],
+            "target_lineup": [2, 3, 5, 6, 7],
+            "minimum_seconds": 100,
+            "official_seconds": {
+                "1": 300, "2": 600, "3": 600,
+                "4": 300, "5": 300, "6": 300, "7": 600,
+            },
+            "segments": [
+                {
+                    "duration_seconds": 300,
+                    "confirmed_players": [2, 7],
+                    "players_substituted": 0,
+                },
+                {
+                    "duration_seconds": 300,
+                    "confirmed_players": [3, 5, 7],
+                    "players_substituted": 2,
+                },
+            ],
+            "scoring_entries": [
+                {"team_points": 2, "opponent_points": 0, "candidate_segments": [1, 2]},
+                {"team_points": 0, "opponent_points": 1, "candidate_segments": [1, 2]},
+            ],
+            "score_checkpoints": [],
+        },
+    },
+    "conflict_demo": {
+        "summary": "比分冲突：核对点累计无法由流水前缀凑出",
+        "description": (
+            "记分合计为 (4,3)，但核对点 1 要求片段末累计 (5,0)——"
+            "流水不存在任何前缀等于该累计，记录无法同时成立，返回冲突说明。"
+        ),
+        "value": {
+            "players": [1, 2, 3, 4, 5, 6, 7],
+            "target_lineup": [2, 3, 5, 6, 7],
+            "minimum_seconds": 100,
+            "official_seconds": {
+                "1": 300, "2": 600, "3": 600,
+                "4": 300, "5": 300, "6": 300, "7": 600,
+            },
+            "segments": [
+                {
+                    "duration_seconds": 300,
+                    "confirmed_players": [2, 7],
+                    "players_substituted": 0,
+                },
+                {
+                    "duration_seconds": 300,
+                    "confirmed_players": [3, 5, 7],
+                    "players_substituted": 2,
+                },
+            ],
+            "scoring_entries": [
+                {"team_points": 4, "opponent_points": 0, "candidate_segments": [1]},
+                {"team_points": 0, "opponent_points": 3, "candidate_segments": [2]},
+            ],
+            "score_checkpoints": [
+                {
+                    "segment_number": 1,
+                    "team_cumulative_points": 5,
+                    "opponent_cumulative_points": 0,
+                }
+            ],
+        },
+    },
+}
+
+
+def _plan_to_schema(
+    req: RosterReconcileRequest, plan: AttributionPlan
+) -> ScoreAttribution:
+    return ScoreAttribution(
+        label=plan.label,
+        entry_assignments=[
+            EntryAssignment(
+                entry_index=k + 1,
+                segment_number=seg,
+                team_points=req.scoring_entries[k].team_points,
+                opponent_points=req.scoring_entries[k].opponent_points,
+                net_points=req.scoring_entries[k].team_points
+                - req.scoring_entries[k].opponent_points,
+            )
+            for k, seg in enumerate(plan.entry_segments)
+        ],
+        segment_team_points=plan.segment_team_points,
+        segment_opponent_points=plan.segment_opponent_points,
+        segment_net_points=plan.segment_net_points,
+        checkpoints=[CheckpointResult(**c) for c in plan.checkpoint_results],
+    )
+
+
+@app.post(
+    "/api/v1/roster/reconcile",
+    response_model=ReconcileResponse,
+    summary="把有序记分流水归入换人片段，补齐 team_net_points",
+    tags=["reconcile"],
+)
+def reconcile_roster(
+    req: RosterReconcileRequest = Body(
+        ...,
+        openapi_examples=RECONCILE_EXAMPLES,
+    )
+) -> ReconcileResponse:
+    started = time.perf_counter()
+    outcome = ScoreReconciler(req).run()
+    return ReconcileResponse(
+        status=outcome.status,
+        status_label_zh=outcome.status_label_zh,
+        affected_segments=outcome.affected_segments,
+        witness_segment=outcome.witness_segment,
+        resolved_team_net_points=outcome.resolved_team_net_points,
+        request_body=outcome.request_body,
+        witnesses=[_plan_to_schema(req, p) for p in outcome.plans],
+        conflicts=outcome.conflicts,
+        verification=outcome.verification,
+        verification_errors=outcome.verification_errors,
+        elapsed_ms=(time.perf_counter() - started) * 1000,
+    )
+
+
+@app.get(
+    "/docs/reconcile",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+    summary="记分流水对账：可调用的示例页",
+)
+def reconcile_demo_page() -> str:
+    """轻量示例页：内嵌三个对账示例，可一键调用 /api/v1/roster/reconcile。"""
+    examples = RECONCILE_EXAMPLES
+    examples_json = json.dumps(examples, ensure_ascii=False).replace("</", "<\\/")
+    options = "".join(
+        f'<option value="{name}">{html.escape(ex["summary"])}</option>'
+        for name, ex in examples.items()
+    )
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>记分流水对账示例</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 980px; }}
+  textarea {{ width: 100%; height: 320px; font-family: ui-monospace, monospace; }}
+  pre {{ background: #f6f8fa; padding: 1rem; overflow: auto; max-height: 480px; }}
+  .row {{ display: flex; gap: .75rem; align-items: center; margin: 1rem 0; }}
+  a {{ color: #0969da; }}
+</style>
+</head>
+<body>
+<h1>记分流水对账</h1>
+<p>
+  片段输入不含 <code>team_net_points</code>；记分流水按时间有序，每笔给出双方增分与
+  候选片段号，可附片段末比分核对点。
+  <a href="/docs">返回 OpenAPI 文档</a>
+</p>
+<div class="row">
+  <select id="example" style="flex:1">{options}</select>
+  <button onclick="loadExample()">载入示例</button>
+  <button onclick="send()">调用 /api/v1/roster/reconcile</button>
+</div>
+<textarea id="payload" spellcheck="false"></textarea>
+<h2>响应</h2>
+<pre id="output">（尚未调用）</pre>
+<script>
+const EXAMPLES = {examples_json};
+function loadExample() {{
+  const key = document.getElementById('example').value;
+  document.getElementById('payload').value =
+    JSON.stringify(EXAMPLES[key].value, null, 2);
+}}
+async function send() {{
+  const out = document.getElementById('output');
+  try {{
+    const resp = await fetch('/api/v1/roster/reconcile', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: document.getElementById('payload').value,
+    }});
+    out.textContent = JSON.stringify(await resp.json(), null, 2);
+  }} catch (err) {{
+    out.textContent = String(err);
+  }}
+}}
+loadExample();
+</script>
+</body>
+</html>"""
 
 
 @app.get("/health", response_model=HealthResponse, tags=["system"])
